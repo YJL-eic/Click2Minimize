@@ -1,68 +1,78 @@
-import SwiftUI
+import Cocoa
 import ServiceManagement
 
-struct ContentView: View {
-    @Environment(\.presentationMode) var presentationMode
+/// Settings window. AppKit rather than SwiftUI so the app still builds with
+/// Command Line Tools, which do not ship the SwiftUI macro plugin.
+final class SettingsViewController: NSViewController {
+    private let enableToggle = NSButton(checkboxWithTitle: "Enable Click2Minimize", target: nil, action: nil)
+    private let loginToggle = NSButton(checkboxWithTitle: "Launch at login", target: nil, action: nil)
 
-    @State private var isClickToMinimizeEnabled: Bool = {
-        if UserDefaults.standard.object(forKey: "ClickToMinimizeEnabled") == nil {
-            UserDefaults.standard.set(true, forKey: "ClickToMinimizeEnabled")
-            return true
-        }
-        return UserDefaults.standard.bool(forKey: "ClickToMinimizeEnabled")
-    }()
+    override func loadView() {
+        let title = NSTextField(labelWithString: "Click2Minimize")
+        title.font = .boldSystemFont(ofSize: 13)
 
-    @State private var launchAtLogin: Bool = {
-        if UserDefaults.standard.object(forKey: "LaunchAtLoginEnabled") == nil { return false }
-        return UserDefaults.standard.bool(forKey: "LaunchAtLoginEnabled")
-    }()
+        enableToggle.target = self
+        enableToggle.action = #selector(enableChanged(_:))
+        enableToggle.state = UserDefaults.standard.object(forKey: "ClickToMinimizeEnabled") == nil
+            || UserDefaults.standard.bool(forKey: "ClickToMinimizeEnabled") ? .on : .off
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Click2Minimize")
-                .font(.headline)
-                .padding(.top, 4)
+        loginToggle.target = self
+        loginToggle.action = #selector(loginChanged(_:))
+        loginToggle.state = UserDefaults.standard.bool(forKey: "LaunchAtLoginEnabled") ? .on : .off
 
-            Divider()
+        let footnote = NSTextField(wrappingLabelWithString: "If the app doesn't work, enable Accessibility and Automation permissions from the menu-bar menu.")
+        footnote.font = .systemFont(ofSize: 11)
+        footnote.textColor = .secondaryLabelColor
 
-            Toggle("Enable Click2Minimize", isOn: $isClickToMinimizeEnabled)
-                .onChange(of: isClickToMinimizeEnabled) { newValue in
-                    UserDefaults.standard.set(newValue, forKey: "ClickToMinimizeEnabled")
-                    NotificationCenter.default.post(
-                        name: NSNotification.Name("ClickToHideStateChanged"),
-                        object: newValue
-                    )
+        let stack = NSStackView(views: [title, divider(), enableToggle, loginToggle, divider(), footnote])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        stack.frame = NSRect(x: 0, y: 0, width: 280, height: 180)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 180))
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: container.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            container.widthAnchor.constraint(equalToConstant: 280)
+        ])
+        view = container
+    }
+
+    private func divider() -> NSView {
+        let box = NSBox()
+        box.boxType = .separator
+        return box
+    }
+
+    @objc private func enableChanged(_ sender: NSButton) {
+        let enabled = sender.state == .on
+        UserDefaults.standard.set(enabled, forKey: "ClickToMinimizeEnabled")
+        NotificationCenter.default.post(
+            name: NSNotification.Name("ClickToHideStateChanged"),
+            object: enabled
+        )
+    }
+
+    @objc private func loginChanged(_ sender: NSButton) {
+        let enabled = sender.state == .on
+        UserDefaults.standard.set(enabled, forKey: "LaunchAtLoginEnabled")
+        do {
+            if enabled {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
                 }
-
-            Toggle("Launch at login", isOn: $launchAtLogin)
-                .onChange(of: launchAtLogin) { newValue in
-                    UserDefaults.standard.set(newValue, forKey: "LaunchAtLoginEnabled")
-                    do {
-                        if newValue {
-                            if SMAppService.mainApp.status != .enabled {
-                                try SMAppService.mainApp.register()
-                            }
-                        } else {
-                            if SMAppService.mainApp.status == .enabled {
-                                try SMAppService.mainApp.unregister()
-                            }
-                        }
-                    } catch {
-                        // Roll the toggle back on failure
-                        launchAtLogin = !newValue
-                        UserDefaults.standard.set(!newValue, forKey: "LaunchAtLoginEnabled")
-                    }
-                }
-
-            Divider()
-
-            Text("If the app doesn't work, enable Accessibility and Automation permissions from the menu-bar menu.")
-                .font(.footnote)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.leading)
-                .fixedSize(horizontal: false, vertical: true)
+            } else if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            sender.state = enabled ? .off : .on
+            UserDefaults.standard.set(!enabled, forKey: "LaunchAtLoginEnabled")
         }
-        .padding(16)
-        .frame(width: 280)
     }
 }

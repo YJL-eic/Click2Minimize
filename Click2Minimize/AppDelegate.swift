@@ -66,9 +66,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let window = mainWindow {
             window.makeKeyAndOrderFront(nil)
         } else {
-            let contentView = ContentView()
-            let hostingController = NSHostingController(rootView: contentView)
-            let window = NSWindow(contentViewController: hostingController)
+            let window = NSWindow(contentViewController: SettingsViewController())
             window.title = "Version \(currentVersion)"
             window.styleMask = [.titled, .closable]
             window.center()
@@ -85,11 +83,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func applicationDidFinishLaunching(_ aNotification: Notification) {
-        // Check for accessibility permissions
-        if !isAccessibilityEnabled() {
-            promptForAccessibilityPermission()
-        }
-
         // Set the application to be an accessory application
         NSApplication.shared.setActivationPolicy(.accessory)
 
@@ -107,10 +100,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             registerLoginItem()
         }
         setupAppDict()
-        setupEventTap()
 
         log.info("Click2Minimize launched")
-        updateDockItems()
+        if !setupEventTap() {
+            openAccessibilityPreferences()
+            startAccessibilityRetry()
+            presentAccessibilityAlert()
+        } else {
+            updateDockItems()
+        }
+    }
+
+    /// Replacing the app changes its code signature, so an existing Accessibility
+    /// switch can read as on while event taps still fail. Poll the tap itself.
+    private func startAccessibilityRetry() {
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            if self.setupEventTap() {
+                timer.invalidate()
+                self.updateDockItems()
+                log.info("accessibility granted, event tap ready")
+                if NSApp.modalWindow != nil {
+                    NSApp.stopModal()
+                }
+            }
+        }
+    }
+
+    private func presentAccessibilityAlert() {
+        let alert = NSAlert()
+        alert.messageText = "需要重新打开辅助功能"
+        alert.informativeText = """
+        系统设置已经打开。在「辅助功能」里找到 Click2Minimize：
+
+        开关如果是关的，打开它。
+        开关如果已经是开的，先关掉，再打开。
+
+        不用退出这个程序。打开后它会自己开始工作。
+        """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "好")
+        DispatchQueue.main.async {
+            alert.runModal()
+        }
     }
 
     /// Whether the user has opted in to launch-at-login. Default: false.
@@ -161,7 +196,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         appDict["Rosetta Stone Learn Languages"] = "Rosetta Stone"
     }
     
-    func setupEventTap() {
+    @discardableResult
+    func setupEventTap() -> Bool {
+        if eventTap != nil { return true }
         let eventMask: CGEventMask = (1 << CGEventType.leftMouseDown.rawValue) // Capture only left mouse clicks
         
         // Create the event tap
@@ -178,7 +215,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             userInfo: Unmanaged.passUnretained(self).toOpaque() // Pass the AppDelegate as userInfo
         ) else {
             log.error("failed to create event tap — accessibility permission missing?")
-            return
+            return false
         }
 
         let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0)
@@ -186,9 +223,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         self.eventTap = eventTap
         log.info("event tap installed")
+        return true
     }
 
     static func eventTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent?, appDelegate: AppDelegate) -> Unmanaged<CGEvent>? {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let tap = appDelegate.eventTap {
+                CGEvent.tapEnable(tap: tap, enable: true)
+            }
+            log.error("event tap was disabled; re-enabled")
+            return event.map { Unmanaged.passUnretained($0) }
+        }
+
         guard let event = event else { return nil }
 
         // Pass-through if disabled or the frontmost app is fullscreen.
@@ -207,10 +253,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let runningApps = NSWorkspace.shared.runningApplications
-        guard let app = runningApps.first(where: {
-            $0.localizedName == dockItem.appID || $0.localizedName == appDelegate.appDict[dockItem.appID]
+        let finderDockNames: Set<String> = ["Finder", "访达"]
+        guard let app = runningApps.first(where: { candidate in
+            if finderDockNames.contains(dockItem.appID) {
+                return candidate.bundleIdentifier == "com.apple.finder"
+            }
+            return candidate.localizedName == dockItem.appID || candidate.localizedName == appDelegate.appDict[dockItem.appID]
         }) else {
             log.debug("no running application matched dock item: \(dockItem.appID, privacy: .public)")
+            return Unmanaged.passUnretained(event)
+        }
+
+        // Finder's Dock click does not reopen minimized windows. Drive both
+        // directions through Finder's own `collapsed` property.
+        if app.bundleIdentifier == "com.apple.finder" {
+            let wasActive = app.isActive && !app.isHidden
+            DispatchQueue.main.async {
+                AppDelegate.toggleFinderWindows(wasActive: wasActive)
+            }
+            log.info("Finder dock click, wasActive=\(wasActive, privacy: .public)")
+            if wasActive {
+                return nil
+            }
             return Unmanaged.passUnretained(event)
         }
 
@@ -220,36 +284,121 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return Unmanaged.passUnretained(event)
         }
 
-        let minimized = AppDelegate.minimizeAppWindows(for: app)
-        if minimized {
+        switch AppDelegate.toggleAppWindows(for: app) {
+        case .minimized:
             log.debug("minimized windows for: \(app.localizedName ?? "Unknown", privacy: .public)")
             return nil
+        case .restored:
+            log.debug("restored windows for: \(app.localizedName ?? "Unknown", privacy: .public)")
+            return nil
+        case .ignored:
+            return Unmanaged.passUnretained(event)
         }
-        return Unmanaged.passUnretained(event)
     }
 
-    static func minimizeAppWindows(for app: NSRunningApplication) -> Bool {
+    private enum WindowToggle {
+        case minimized
+        case restored
+        case ignored
+    }
+
+    /// Clicking the dock icon of the already-active app toggles its windows.
+    /// Visible windows are minimized. If none are visible, minimized windows are
+    /// restored here — the Dock click is not a reliable restore, and Finder
+    /// ignores that click entirely once every window is collapsed.
+    private static func toggleAppWindows(for app: NSRunningApplication) -> WindowToggle {
         let appElement = AXUIElementCreateApplication(app.processIdentifier)
         var windowsRef: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsRef)
-        
-        guard result == .success, let windows = windowsRef as? [AXUIElement] else {
-            return false
-        }
-        
-        var minimizedAny = false
-        for window in windows {
+        let windows = (result == .success ? windowsRef as? [AXUIElement] : nil) ?? []
+
+        var visible: [AXUIElement] = []
+        var minimized: [AXUIElement] = []
+        for window in windows where isToggleableWindow(window) {
             var minimizedRef: CFTypeRef?
-            if AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimizedRef) == .success,
-               let isMinimized = minimizedRef as? Bool, isMinimized == false {
-                
-                let setStatus = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, true as CFTypeRef)
-                if setStatus == .success {
-                    minimizedAny = true
-                }
+            guard AXUIElementCopyAttributeValue(window, kAXMinimizedAttribute as CFString, &minimizedRef) == .success,
+                  let isMinimized = minimizedRef as? Bool else { continue }
+            if isMinimized {
+                minimized.append(window)
+            } else {
+                visible.append(window)
             }
         }
-        return minimizedAny
+
+        if !visible.isEmpty {
+            var didMinimize = false
+            for window in visible {
+                let setStatus = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, true as CFTypeRef)
+                if setStatus == .success {
+                    didMinimize = true
+                }
+            }
+            if didMinimize {
+                return .minimized
+            }
+        }
+
+        if restoreMinimizedWindows(minimized) {
+            return .restored
+        }
+
+        return .ignored
+    }
+
+    /// Toggle Finder from its scripting interface. Accessibility often still
+    /// reports a minimized Finder window as visible, so the AX path never restores it.
+    private static func toggleFinderWindows(wasActive: Bool) {
+        let activeFlag = wasActive ? "true" : "false"
+        let script = """
+        tell application "Finder"
+            set openCount to count of (windows whose collapsed is false)
+            set totalCount to count of windows
+            if openCount > 0 then
+                if \(activeFlag) then
+                    set collapsed of every window to true
+                    return "minimized"
+                end if
+                return "ignored"
+            else if totalCount is 0 then
+                make new Finder window
+                activate
+                return "restored"
+            else
+                set collapsed of every window to false
+                activate
+                return "restored"
+            end if
+        end tell
+        """
+        var error: NSDictionary?
+        let result = NSAppleScript(source: script)?.executeAndReturnError(&error)
+        if let error {
+            log.error("Finder toggle failed: \(String(describing: error), privacy: .public)")
+            return
+        }
+        let action = result?.stringValue ?? "done"
+        log.info("Finder toggle: \(action, privacy: .public)")
+    }
+
+    private static func isToggleableWindow(_ window: AXUIElement) -> Bool {
+        var subroleRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window, kAXSubroleAttribute as CFString, &subroleRef) == .success,
+              let subrole = subroleRef as? String else {
+            return true
+        }
+        return subrole == (kAXStandardWindowSubrole as String)
+    }
+
+    private static func restoreMinimizedWindows(_ windows: [AXUIElement]) -> Bool {
+        var didRestore = false
+        for window in windows {
+            let setStatus = AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, false as CFTypeRef)
+            if setStatus == .success {
+                AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+                didRestore = true
+            }
+        }
+        return didRestore
     }
 
     /// True if the frontmost (non-Click2Minimize) app has at least one fullscreen window.
@@ -368,24 +517,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func promptForAccessibilityPermission() {
         let alert = NSAlert()
         alert.messageText = "Accessibility Permission Required"
-        alert.informativeText = 
-        """
-        To allow Click2Minimize to control the system dock, please enable accessibility permissions for it in System Preferences.
-        
-        Please relaunch app after permission granted.
+        alert.informativeText = """
+        在「辅助功能」里找到 Click2Minimize。开关如果已经开着，先关掉再打开。不用退出程序。
         """
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Preferences")
-
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            openAccessibilityPreferences()
-            // Quit the application as it won't work without permission
-            // Delay termination by 1 second
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                NSApplication.shared.terminate(nil)
-            }
-        }
+        alert.addButton(withTitle: "好")
+        openAccessibilityPreferences()
+        alert.runModal()
     }
 
     func openAccessibilityPreferences() {
